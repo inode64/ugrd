@@ -1,3 +1,4 @@
+from os import fsdecode
 from pathlib import Path
 from shutil import copy2
 from subprocess import CompletedProcess, TimeoutExpired, run
@@ -222,9 +223,9 @@ class GeneratorHelpers:
                     args = args[0]  # When there's a timeout, args is a (args, timeout) tuple
                 self.logger.error("Failed command: %s" % c_(" ".join(args), "red", bright=True))
             if stdout := ret.stdout:
-                self.logger.error("Command output:\n%s" % stdout.decode())
+                self.logger.error("Command output:\n%s" % fsdecode(stdout))
             if stderr := ret.stderr:
-                self.logger.error("Command error:\n%s" % stderr.decode())
+                self.logger.error("Command error:\n%s" % fsdecode(stderr))
 
         timeout = timeout or self.timeout
         cmd_args = [str(arg) for arg in args]

@@ -1,10 +1,21 @@
 __author__ = "desultory"
-__version__ = "3.9.0"
+__version__ = "3.10.0"
 
+from importlib import import_module
+from os import uname
 from pathlib import Path
 
 from pycpio.cpio.symlink import CPIO_Symlink
 from zenlib.util import colorize, contains, unset
+
+
+# Compression candidates, ordered from best ratio to worst.
+# Each entry: (cpio_compression value, kernel CONFIG_RD_* suffix, Python module name)
+# Only backends supported by pycpio are listed.
+_COMPRESSION_CANDIDATES = [
+    ("xz", "RD_XZ", "lzma"),
+    ("zstd", "RD_ZSTD", "zstandard"),
+]
 
 
 @contains("check_cpio")
@@ -61,6 +72,147 @@ def _check_in_cpio(self, file, lines=[], quiet=False) -> None:
                 raise FileNotFoundError("Line not found in CPIO: %s" % line)
             else:
                 self.logger.debug("Line found in CPIO: %s" % line)
+
+
+def _resolve_kernel_config_path(self) -> Path | None:
+    """Returns the path to the kernel .config the initramfs will boot under, or None.
+
+    Prefers `kernel_config_file` if `ugrd.kmod.kconfig` already populated it; falls back
+    to /lib/modules/<kver>/{build,source}/.config and /boot/config-<kver>.
+    """
+    if path := self.get("kernel_config_file"):
+        return Path(path)
+
+    kver = self.get("kernel_version") or uname().release
+    for candidate in (
+        Path(f"/lib/modules/{kver}/build/.config"),
+        Path(f"/lib/modules/{kver}/source/.config"),
+        Path(f"/boot/config-{kver}"),
+    ):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _kernel_supports_decompressor(self, kconfig_suffix: str):
+    """Whether the kernel has CONFIG_<kconfig_suffix> set to y or m.
+
+    Returns True/False if the config was inspected, None if the .config could not be located.
+    """
+    config_path = _resolve_kernel_config_path(self)
+    if config_path is None:
+        return None
+
+    target = "CONFIG_" + kconfig_suffix + "="
+    try:
+        with open(config_path) as f:
+            for line in f:
+                if line.startswith(target):
+                    value = line[len(target):].strip()
+                    return bool(value) and value[0] in ("y", "m")
+    except OSError as e:
+        self.logger.warning("Failed to read kernel config %s: %s" % (config_path, e))
+        return None
+    return False
+
+
+def _python_compressor_available(module_name: str) -> bool:
+    try:
+        import_module(module_name)
+        return True
+    except ImportError:
+        return False
+
+
+def autodetect_compression(self) -> None:
+    """Validate or auto-select cpio_compression.
+
+    Behaviour by value:
+      - 'auto': pick the best supported backend from _COMPRESSION_CANDIDATES.
+      - explicit backend ('xz', 'zstd', or 'true' which means xz): use it if both
+        the kernel (CONFIG_RD_<TYPE>) and the Python module are available;
+        otherwise fall back to the next supported candidate, finally to no
+        compression rather than failing the build.
+      - any other string (e.g. 'lz4', 'gzip'): not supported by pycpio, so fall
+        back to the best supported candidate or to no compression.
+      - 'false' / non-string values: passed through unchanged.
+
+    Kernel config is checked only when it can be located; an unverifiable kernel
+    is treated as "trust the user" rather than blocking.
+    """
+    raw = self.get("cpio_compression")
+    if not isinstance(raw, str):
+        return
+    requested = raw.lower()
+    if requested == "false":
+        return
+
+    # 'true' is the legacy alias for xz; normalize so we validate it like any other backend.
+    if requested == "true":
+        requested = "xz"
+
+    auto = requested == "auto"
+
+    if auto:
+        candidates = list(_COMPRESSION_CANDIDATES)
+    else:
+        match = next((c for c in _COMPRESSION_CANDIDATES if c[0] == requested), None)
+        if match is None:
+            self.logger.warning(
+                "[cpio_compression] %s is not a supported backend; falling back to the best available."
+                % colorize(raw, "yellow", bold=True)
+            )
+            # Fall back through the supported backends in priority order (auto-style search).
+            candidates = list(_COMPRESSION_CANDIDATES)
+            auto = True
+        else:
+            # Try the requested backend first, then fall back to the others in priority order.
+            candidates = [match] + [c for c in _COMPRESSION_CANDIDATES if c[0] != requested]
+
+    chosen = False
+    for index, (name, kconfig, module) in enumerate(candidates):
+        kernel_ok = _kernel_supports_decompressor(self, kconfig)
+        is_requested = not auto and index == 0
+
+        if kernel_ok is False:
+            log = self.logger.warning if is_requested else self.logger.info
+            log(
+                "[cpio_compression] Kernel does not enable %s, skipping %s."
+                % (colorize("CONFIG_" + kconfig, "yellow"), colorize(name, "yellow"))
+            )
+            continue
+
+        if not _python_compressor_available(module):
+            self.logger.warning(
+                "[cpio_compression] Python module %s is not installed; cannot use %s compression. "
+                "Install it (e.g. `pip install %s`) to enable it."
+                % (colorize(module, "yellow", bold=True), colorize(name, "yellow"), module)
+            )
+            continue
+
+        if kernel_ok is None:
+            self.logger.warning(
+                "[cpio_compression] Kernel config could not be located; "
+                "selecting %s without verifying CONFIG_%s."
+                % (colorize(name, "cyan"), kconfig)
+            )
+        elif auto or is_requested:
+            self.logger.info("[cpio_compression] Selected %s." % colorize(name, "green", bold=True))
+        else:
+            self.logger.warning(
+                "[cpio_compression] Falling back to %s (requested %s unavailable)."
+                % (colorize(name, "green", bold=True), colorize(requested, "yellow"))
+            )
+
+        chosen = name
+        break
+
+    if chosen is False:
+        self.logger.warning(
+            "[cpio_compression] No suitable compression backend found; falling back to no compression."
+        )
+
+    self["cpio_compression"] = chosen
 
 
 @unset("out_file")
